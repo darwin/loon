@@ -316,6 +316,11 @@ impl ModuleCache {
             .insert(canonical, ModuleState::Loaded(exports.clone()));
         Ok(exports)
     }
+
+    /// Returns paths of all modules loaded during evaluation.
+    pub fn loaded_module_paths(&self) -> Vec<PathBuf> {
+        self.modules.keys().cloned().collect()
+    }
 }
 
 impl Default for ModuleCache {
