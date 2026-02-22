@@ -18,7 +18,7 @@ use crate::module::ModuleCache;
 use crate::syntax::Span;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 thread_local! {
@@ -857,6 +857,111 @@ pub fn eval_program_with_modules(
         }
     }
     Ok(last)
+}
+
+/// Evaluate a program with a caller-provided environment.
+///
+/// Reuses the given `env` (preserving existing builtins and globals)
+/// instead of allocating a fresh one. When `track_modules` is true,
+/// returns the list of `.oo` module paths loaded via `[use ...]`.
+pub fn eval_program_with_env_and_base_dir(
+    exprs: &[Expr],
+    env: &mut Env,
+    base_dir: Option<&Path>,
+    track_modules: bool,
+) -> Result<(Value, Vec<PathBuf>), InterpError> {
+    // Macro expansion phase
+    let mut expander = crate::macros::MacroExpander::new();
+    let exprs = expander.expand_program(exprs).map_err(err)?;
+
+    let default_base = std::path::PathBuf::from(".");
+    let base = base_dir.unwrap_or(&default_base);
+    let mut cache = match crate::pkg::Manifest::load(base) {
+        Ok(Some(manifest)) => {
+            let lockfile = crate::pkg::lockfile::Lockfile::load(base).ok().flatten();
+            ModuleCache::with_manifest_and_lockfile(manifest, lockfile, base.to_path_buf())
+        }
+        _ => ModuleCache::new(),
+    };
+    sync_global_env(env);
+
+    let mut last = Value::Unit;
+    for expr in &exprs {
+        if let ExprKind::List(items) = &expr.kind {
+            if !items.is_empty() {
+                if let ExprKind::Symbol(s) = &items[0].kind {
+                    if s == "use" {
+                        eval_use_with_cache(&items[1..], env, base, &mut cache)?;
+                        continue;
+                    }
+                }
+            }
+        }
+        match eval(expr, env) {
+            Ok(val) => last = val,
+            Err(e) => {
+                if let Some(ref performed) = e.performed_effect {
+                    if let Some(result) = try_builtin_handler(performed) {
+                        last = result?;
+                    } else {
+                        return Err(e);
+                    }
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    sync_global_env(env);
+    if let Some(Value::Fn(main_fn)) = env.get("main") {
+        match call_fn(&main_fn, &[], env, Span::ZERO) {
+            Ok(val) => {
+                let paths = if track_modules {
+                    cache.loaded_module_paths()
+                } else {
+                    Vec::new()
+                };
+                return Ok((val, paths));
+            }
+            Err(e) => {
+                if let Some(ref performed) = e.performed_effect {
+                    if let Some(result) = try_builtin_handler(performed) {
+                        let val = result?;
+                        let paths = if track_modules {
+                            cache.loaded_module_paths()
+                        } else {
+                            Vec::new()
+                        };
+                        return Ok((val, paths));
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+    let paths = if track_modules {
+        cache.loaded_module_paths()
+    } else {
+        Vec::new()
+    };
+    Ok((last, paths))
+}
+
+/// Evaluate a program and return both the result value and the list of
+/// module paths loaded during evaluation (via `[use ...]`).
+pub fn eval_program_with_module_tracking(
+    exprs: &[Expr],
+    base_dir: Option<&Path>,
+) -> Result<(Value, Vec<PathBuf>), InterpError> {
+    let mut env = Env::new();
+    register_builtins(&mut env);
+    // Load prelude (Option, Result types)
+    if let Ok(prelude_exprs) = crate::parser::parse(crate::prelude::PRELUDE) {
+        for expr in &prelude_exprs {
+            let _ = eval(expr, &mut env);
+        }
+    }
+    eval_program_with_env_and_base_dir(exprs, &mut env, base_dir, true)
 }
 
 pub(crate) fn sync_global_env(env: &Env) {
